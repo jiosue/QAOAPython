@@ -24,8 +24,12 @@ def solve(C, p=1, backend="cirq"):
     
     for _ in range(p):
         print("Starting with p =", _+1)
-        m, b, g = system.find_max(betas_0, gammas_0, 
-                                  method="Powell", maxiter=1000, verbose=False)
+        m, b, g = system.find_max(
+            betas_0, gammas_0, 
+            method="Powell",
+            options=dict(maxfev=1000),
+            verbose=False
+        )
         print("Found max to be", m, "\n")
         # Add parameter to go the next p value. By initializing to zero, we
         # should not see the cost function immediately decrease.
@@ -33,7 +37,7 @@ def solve(C, p=1, backend="cirq"):
         gammas_0 = g + [0.0]
         
     
-    print("Max of", system, "found with p =", p, "to be:", m, "\n")
+    print("\nMax of", system, "found with p =", p, "to be:", m, "\n")
     print("Betas found:", b)
     print("Gammas found:", g, "\n")
     print("Resulting state, |gamma, beta>:", system.get_state(b, g))

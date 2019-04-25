@@ -9,6 +9,17 @@ BACKENDS = {
 }
 
 
+def prod(l):
+    """
+    l: iterable of numbers.
+    
+    returns: product of all numbers in l
+    """
+    p = 1
+    for i in l: p *= i
+    return p
+
+
 def exponentiate_zs(qubits, angle):
     """
     Let q0 = qubits[0], ..., qn = qubits[n].
@@ -100,35 +111,38 @@ class QAOA:
             alg.extend(self.UC(gammas[i]))
             alg.extend(self.UB(betas[i]))
         return alg
+        
+    def cost(self, state):
+        """
+        state: str, ie "0010...". Assumes len(state) == self.num_qubits
+        
+        returns: The cost function given this state.
+        """
+        mapping = {
+            i: 1 if state[i] == "0" else -1 for i in range(len(state))
+        }
+        return sum(
+            self.w_alphas[alpha] *
+            prod([mapping[i] for i in self.c_alphas[alpha]])
+            for alpha in range(len(self.w_alphas))
+        )
 
-    def expectation_value(self, ansatz, c_alpha):
+    def expectation_value(self, ansatz):
         """
         ansatz: list of strs, gate sequence to prepare |gamma, beta>.
-        c_alpha: list of ints, qubits for z(q1)...z(qn) for qi = c_alpha[i].
         
-        return: float, <gamma, beta | c_alpha | gamma, beta>
+        return: float, <gamma, beta | C | gamma, beta>
         """
-        if not c_alpha: return 1 # identity
-
-        alg = ansatz + [ # measure each qubit that c_alpha has a z on.
-            "measure" + str(tuple(reversed(x))) for x in enumerate(c_alpha)
-        ]
         
-        res = self.run_qc(alg)
+        res = self.run_qc(ansatz) # measure all qubits
         # `res` is a dictionary mapping states to probabilities (where the
-        # probabilities were determined from sampling). So, ie if we were
-        # measuring c_alpha = [0, 2], ie < z(0) z(2) >, then `res` would 
-        # look like {"00": float, "01": float, "10": float, "11": float},
-        # where the first bit in the string corresponds to the measurement
-        # of the 0th qubit, and the second bit in the string corresponds
-        # to the measurement of the second qubit.
+        # probabilities were determined from sampling).
         
         # compute the expectation value from the probabilities.
         
         ev = 0.0
         for state, prob in res.items():
-            if state.count("1") % 2: ev -= prob  # odd number of ones gives neg
-            else: ev += prob
+            ev += self.cost(state) * prob
         return ev
     
     def objective_function(self, params):
@@ -140,28 +154,57 @@ class QAOA:
         self.iters += 1
         n = len(params) // 2
         ansatz = self.prepare_ansatz(params[:n], params[n:])
-        f = -1 * sum(
-            self.expectation_value(ansatz, self.c_alphas[i]) * self.w_alphas[i]
-            for i in range(len(self.c_alphas))
-        )
+        f = -1 * self.expectation_value(ansatz)
         if self.verbose: print("%d obj func eval: %g" % (self.iters, -1*f))
         return f
             
-    def find_max(self, betas_0, gammas_0, 
-                       method="Powell", maxiter=None, verbose=True):
+    def find_max(self, betas_0, gammas_0, **kwargs):
         """
         betas_0: list of floats, 
                     initial angles for U(B, beta). beta in [0, pi]
         gammas_0: list of floats, initial angles for U(C, gamma). 
                     gamma in [0, 2pi]. 
                   NOTE: len(betas_0) = len(gammas_0) = p.
-        method: str, minimization method to use (for scipy.minimize).
-        maxiter: int, maximum number of iterations.
-        verbose: bool, whether to print updates.
-        
+        **kwargs:
+            verbose: bool, whether to print updates. Note that 
+                           even if verbose is set to False, this
+                           function will still print the
+                           scipy.optimize.OptimizeResult result from
+                           the minimization.
+            
+            kwargs otherwise contains any arguments that are passed
+            into the scipy.optimize.minimize function. For example,
+            to use the COBYLA method with a maximum number of
+            iterations set to 500, terminating the optimization
+            with a relative tolerance of 0.01, constraining the
+            angles to stay in [-pi, pi], and printing updates, 
+            you would call:
+                
+                p = 2 # choose whatever p you want
+                
+                # make constraints
+                constraints = []
+                for i in range(2):
+                    constraints.append(dict(
+                        type="ineq",
+                        fun=lambda params: pi - abs(params[i])
+                ))
+                
+                # initialize 2p random angles
+                b_0, g_0 = np.random.random(p)*pi, np.random.random(p)*pi
+                
+                system = QAOA(C)
+                m, b, g = system.find_max(
+                    b_0, g_0, 
+                    method="COBYLA",
+                    options=dict(maxiter=500, ftol=0.01),
+                    constraints=constraints,
+                    verbose=True
+                )
+                        
         return: tuple; (max C (float), betas (list), gammas (list))
         """
-        self.iters, self.verbose = 0, verbose
+        self.iters, self.verbose = 0, kwargs.pop("verbose", False)
         p = len(betas_0)
         if p != len(gammas_0):
             raise ValueError(
@@ -169,16 +212,13 @@ class QAOA:
             )
         if self.verbose: print("Finding maximum of", self, "with p =", p, "\n")
         
-        if maxiter is not None: kwargs = dict(options=dict(maxiter=maxiter))
-        else: kwargs = {}
-        
         res = minimize(
             self.objective_function,
-            list(betas_0) + list(gammas_0), # in case they are np.arrays.
-            method=method,
+            list(betas_0) + list(gammas_0), # in case they are np.arrays, also copy
             **kwargs
         )
         if self.verbose: print("Found maximum to be", -1*res.fun, "\n")
+        print("\n%s\n" % res)
         return -1*res.fun, list(res.x[:p]), list(res.x[p:])
     
     def get_state(self, betas, gammas):
@@ -189,6 +229,20 @@ class QAOA:
         return: dict, result of running ansatz preparation on qc.
         """
         return self.run_qc(self.prepare_ansatz(betas, gammas))
+        
+    def get_prob(self, betas, gammas, states):
+        """
+        Get the probability of being in each state in `states`
+        given the ansatz state |betas, gammas>
+        
+        betas: list of floats, angle for U(B, beta).
+        gammas: list of floats, angles for U(C, beta).
+        states: list of strings, list of states.
+        
+        returns: list of floats, probability to be in each state.
+        """
+        s = self.get_state(betas, gammas)
+        return [s[state] for state in states]
     
     def __str__(self):
         """ Return string representation of objective function """
@@ -224,15 +278,19 @@ if __name__ == "__main__":
     
     print("Cost function:", system, "\n\n")
     
-    p = 1
+    p = 3
     # initialize 2p random parameters.
     betas_0 = np.random.random(p) * np.pi
     gammas_0 = np.random.random(p) * 2 * np.pi
     
-    m, b, g = system.find_max(betas_0, gammas_0, 
-                              method="Powell", maxiter=100, verbose=True)
+    m, b, g = system.find_max(
+        betas_0, gammas_0, 
+        verbose=True,
+        method="Powell",
+        options=dict(maxfev=500)
+    )
     
-    print("Max of", system, "found to be:", m)
+    print("\nMax of", system, "found to be:", m)
     print("Betas found:", b)
     print("Gammas found:", g)
     print("Resulting basis state probabilites of |gamma, beta>:", 
